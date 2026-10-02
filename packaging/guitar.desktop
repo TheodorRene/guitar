@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Guitar
+GenericName=Pitch monitor
+Comment=Tune a guitar and watch your singing pitch
+Exec=@guitar@
+Icon=guitar
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=tuner;pitch;singing;guitar;
+StartupWMClass=guitar
