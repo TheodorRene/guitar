@@ -16,6 +16,17 @@ pub enum Mode {
     Sing,
 }
 
+/// What the sing view draws the pitch on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SingView {
+    /// A treble-8 (tenor) staff with note heads.
+    #[default]
+    Staff,
+    /// A piano roll, one row per semitone.
+    Roll,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -24,13 +35,23 @@ pub struct Settings {
     pub tuning: String,
     /// Reference pitch for A4, Hz.
     pub a4: f32,
-    /// Semitones shown top to bottom in the sing view.
+    /// Semitones shown top to bottom in the piano roll.
     pub span: f32,
+    pub sing_view: SingView,
+    /// A name from `music::KEYS`: the staff's key signature and how notes are spelled.
+    pub key: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: Mode::Tune, tuning: music::TUNINGS[0].name.into(), a4: music::A4_DEFAULT, span: 24.0 }
+        Self {
+            mode: Mode::Tune,
+            tuning: music::TUNINGS[0].name.into(),
+            a4: music::A4_DEFAULT,
+            span: 24.0,
+            sing_view: SingView::Staff,
+            key: music::KEYS[0].name.into(),
+        }
     }
 }
 
@@ -79,5 +100,6 @@ mod tests {
         assert_eq!(s.mode, Mode::Sing);
         assert_eq!(s.a4, 440.0);
         assert_eq!(s.tuning, "Standard");
+        assert_eq!((s.sing_view, s.key.as_str()), (SingView::Staff, "C"));
     }
 }

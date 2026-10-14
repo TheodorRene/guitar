@@ -2,26 +2,33 @@
 //!
 //! Tune: the nearest string of the chosen tuning (or the nearest note, chromatic), a needle
 //! in cents, the strings with a tick once each is in tune, and the last seconds of cents.
-//! Sing: the nearest note and a scrolling piano roll of the pitch, coloured by how close
-//! each held note is to the note it's nearest.
+//! Sing: the nearest note (or the one played on the piano) and the pitch scrolling over a
+//! tenor's treble-8 staff, with a note head per held note, or over a piano roll; coloured by
+//! how close each held note is to the note it's nearest. A keyboard below plays reference
+//! notes to sing against.
 
 mod audio;
+mod glyphs;
 mod music;
+mod piano;
 mod pitch;
 mod settings;
 mod source;
 mod track;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, relative, rgb, size, App, Application, Bounds, ClickEvent, Context,
-    FocusHandle, FontWeight, Hsla, KeyDownEvent, PathBuilder, Pixels, Point, ScrollWheelEvent, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    canvas, div, fill, point, prelude::*, px, relative, rgb, size, App, Application, Bounds, ClickEvent, ContentMask,
+    Context, FocusHandle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Path, PathBuilder, Pixels, Point,
+    ScrollWheelEvent, Size, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 
-use music::{Target, Tuning, TUNINGS};
-use settings::{Mode, Settings};
+use music::{Accidental, Key, Target, Tuning, KEYS, TUNINGS};
+use piano::Piano;
+use settings::{Mode, Settings, SingView};
 use track::Frame;
 
 const TEXT_FONT: &str = "Noto Sans";
@@ -55,6 +62,19 @@ const SING_SMOOTH: usize = 9;
 const GAUGE_CENTS: f32 = 50.0;
 /// A reading older than this (s of input) is no longer live.
 const LIVE: f64 = 0.1;
+/// The staff's steps (lines and spaces) shown at least, D2 to G5: the treble-8 staff with
+/// room for a baritone's lows and a tenor's highs on ledger lines.
+const STAFF_STEPS: (f32, f32) = (15.0, 39.0);
+/// A sung note gets a note head once held this long (s); pieces of one note this close
+/// together are one note.
+const MIN_NOTE: f64 = 0.12;
+const NOTE_JOIN: f64 = 0.08;
+/// A sung note keeps its name until the smoothed pitch strays this far from it (semitones),
+/// so a voice hovering near halfway between two notes (G a little under 50 cents flat,
+/// say) stays one note instead of flickering between G and F♯.
+const NOTE_STICK: f32 = 0.75;
+/// How long a piano key looks pressed after a click.
+const PRESS: Duration = Duration::from_millis(160);
 /// How often the window redraws while nothing moves: keeps the level meter going and
 /// notices new sound.
 const IDLE_TICK: Duration = Duration::from_millis(50);
@@ -154,6 +174,17 @@ struct Monitor {
     tuned: [bool; 6],
     /// Whether the last frame asked for another; when not, the idle tick redraws.
     animating: bool,
+    piano: Piano,
+    /// The note last played on the piano: the sing view measures against it until cleared.
+    target: Option<i32>,
+    pressed: Option<(i32, Instant)>,
+    /// The staff's steps shown (lo, hi), eased to take in what's been sung.
+    staff_range: (f32, f32),
+    /// Where the staff was laid out last frame: its glyphs are placed from it.
+    staff_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Piano keys to press by themselves (s after start, MIDI), from `GUITAR_TEST_PRESS`,
+    /// for tests: the headless test sway has no pointer to click with.
+    scripted: Vec<(f64, i32)>,
 }
 
 impl Monitor {
@@ -171,9 +202,19 @@ impl Monitor {
         })
         .detach();
 
-        let test_signal = std::env::var("GUITAR_TEST_SIGNAL").ok().filter(|v| !v.is_empty() && v != "0");
+        let test_signal = audio::test_signal();
+        let voices = piano::Voices::default();
+        let mut scripted: Vec<(f64, i32)> =
+            std::env::var("GUITAR_TEST_PRESS").unwrap_or_default().split_whitespace().filter_map(parse_press).collect();
+        scripted.sort_by(|a, b| b.0.total_cmp(&a.0));
         Self {
-            track: track::start(audio::start()),
+            scripted,
+            track: track::start(audio::start(voices.clone())),
+            piano: Piano::new(voices, test_signal.is_none()),
+            target: None,
+            pressed: None,
+            staff_range: STAFF_STEPS,
+            staff_bounds: Rc::default(),
             input: test_signal.is_none().then(source::start),
             test_signal,
             settings: Settings::load(),
@@ -205,10 +246,14 @@ impl Monitor {
         self.settings.mode == Mode::Tune && self.tuning().flats
     }
 
+    fn key(&self) -> &'static Key {
+        &KEYS[music::key_index(&self.settings.key)]
+    }
+
     fn target_for(&self, midi: f32) -> Target {
         match self.settings.mode {
             Mode::Tune => Target::for_reading(midi, self.tuning(), self.locked),
-            Mode::Sing => Target { midi: midi.round() as i32, string: None },
+            Mode::Sing => Target { midi: self.target.unwrap_or(midi.round() as i32), string: None },
         }
     }
 
@@ -218,6 +263,10 @@ impl Monitor {
 
     /// Takes in what the analysis has found since the last frame.
     fn update(&mut self) {
+        while self.scripted.last().is_some_and(|&(at, _)| self.started.elapsed().as_secs_f64() >= at) {
+            let (_, midi) = self.scripted.pop().expect("checked");
+            self.press(midi);
+        }
         let wall = Instant::now();
         let dt = wall.duration_since(self.last_render).as_secs_f32().min(0.1);
         self.last_render = wall;
@@ -257,6 +306,7 @@ impl Monitor {
         self.follow_tuning();
         if self.settings.mode == Mode::Sing && self.frozen.is_none() {
             self.follow_voice(dt);
+            self.follow_staff(dt);
         }
         self.animating = self.frozen.is_none() && self.frames.iter().any(|f| f.hz.is_some());
     }
@@ -297,6 +347,20 @@ impl Monitor {
         let span = self.settings.span;
         let want = if hi - lo <= span - 3.0 { (lo + hi) / 2.0 } else { newest };
         self.center += (want - self.center) * (1.0 - (-dt / 0.6).exp());
+    }
+
+    /// Widens the staff to take in what's been sung lately (and the piano's note), easing
+    /// back to the usual range once it's gone.
+    fn follow_staff(&mut self, dt: f32) {
+        let key = self.key();
+        let (mut lo, mut hi) = STAFF_STEPS;
+        let sung = self.frames.iter().filter(|f| f.t >= self.now - SING_SECS).filter_map(|f| f.hz);
+        for step in sung.map(|hz| music::staff_position(self.midi(hz), key)).chain(self.target.map(|m| music::staff_position(m as f32, key))) {
+            (lo, hi) = (lo.min(step - 2.5), hi.max(step + 2.5));
+        }
+        let ease = 1.0 - (-dt / 0.4).exp();
+        self.staff_range.0 += (lo - self.staff_range.0) * ease;
+        self.staff_range.1 += (hi - self.staff_range.1) * ease;
     }
 
     fn reset_ticks(&mut self) {
@@ -341,6 +405,33 @@ impl Monitor {
         }
     }
 
+    fn next_key(&mut self, step: isize) {
+        let i = music::key_index(&self.settings.key) as isize;
+        self.settings.key = KEYS[(i + step).rem_euclid(KEYS.len() as isize) as usize].name.into();
+        self.settings.save();
+    }
+
+    fn toggle_sing_view(&mut self) {
+        self.settings.sing_view = match self.settings.sing_view {
+            SingView::Staff => SingView::Roll,
+            SingView::Roll => SingView::Staff,
+        };
+        self.settings.save();
+    }
+
+    /// Plays a piano key and makes it the note to sing against.
+    fn press(&mut self, midi: i32) {
+        self.target = Some(midi);
+        self.pressed = Some((midi, Instant::now()));
+        self.needle = None;
+        self.piano.play(music::hz_of(midi, self.settings.a4));
+    }
+
+    fn clear_target(&mut self) {
+        self.target = None;
+        self.needle = None;
+    }
+
     fn toggle_freeze(&mut self) {
         self.frozen = match self.frozen {
             Some(_) => None,
@@ -372,6 +463,9 @@ impl Monitor {
                     self.toggle_lock(i);
                 }
             }
+            "v" if self.settings.mode == Mode::Sing => self.toggle_sing_view(),
+            "k" if self.settings.mode == Mode::Sing => self.next_key(if shift { -1 } else { 1 }),
+            "x" | "backspace" => self.clear_target(),
             "[" => self.zoom(1.15),
             "]" => self.zoom(1.0 / 1.15),
             "space" => self.toggle_freeze(),
@@ -458,6 +552,54 @@ impl Monitor {
             .child(div().w(px(64.)).flex().justify_center().font_family(MONO_FONT).child(format!("{:.0} Hz", self.settings.a4)))
             .child(step("a4-up", "+", 1.0));
 
+        let view = self.settings.sing_view;
+        let view_tab = |id: &'static str, label: &'static str, v: SingView| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(5.))
+                .rounded(px(7.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .when(view == v, |d| d.bg(white(0.1)).text_color(white(0.9)))
+                .when(view != v, |d| d.text_color(white(0.45)).hover(|s| s.bg(white(0.05))))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if this.settings.sing_view != v {
+                        this.toggle_sing_view();
+                    }
+                    cx.notify();
+                }))
+        };
+        let views = div()
+            .flex()
+            .gap(px(2.))
+            .p(px(3.))
+            .rounded(px(9.))
+            .bg(white(0.04))
+            .child(view_tab("view-staff", "Staff", SingView::Staff))
+            .child(view_tab("view-roll", "Roll", SingView::Roll));
+        let key = self.key();
+        let key_pill = div()
+            .id("key")
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .bg(white(0.05))
+            .hover(|s| s.bg(white(0.09)))
+            .cursor_pointer()
+            .text_size(px(14.))
+            .child(div().text_color(white(0.45)).child("Key"))
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} major", key.name)))
+            .child(div().text_color(white(0.45)).child(key.relative_minor))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.next_key(1);
+                cx.notify();
+            }));
+
         let input = match (&self.test_signal, &self.input) {
             (Some(kind), _) => Some(format!("Test signal: {kind}")),
             (None, Some(name)) => name.lock().unwrap().clone(),
@@ -470,6 +612,7 @@ impl Monitor {
             .gap(px(14.))
             .child(tabs)
             .when(mode == Mode::Tune, |d| d.child(tuning_pill))
+            .when(mode == Mode::Sing, |d| d.child(views).child(key_pill))
             .child(div().flex_1())
             .children(input.map(|name| div().max_w(px(280.)).truncate().text_size(px(12.)).text_color(white(0.4)).child(name)))
             .child(level_meter(self.level_db))
@@ -478,10 +621,19 @@ impl Monitor {
 
     /// The note being aimed for, big, with its octave; green when on it.
     fn note(&self, height: f32, zone: f32) -> impl IntoElement {
-        // Nothing heard yet: an empty space the note's size, so the layout doesn't jump.
-        let (name, octave) = match self.reading {
-            Some(r) => (music::name(r.target.midi, self.flats()), music::octave(r.target.midi).to_string()),
-            None => (" ", String::new()),
+        // In the sing view, the piano's note shows before anything is sung. Nothing at all
+        // yet: an empty space the note's size, so the layout doesn't jump.
+        let midi = match self.settings.mode {
+            Mode::Sing => self.target.or(self.reading.map(|r| r.target.midi)),
+            Mode::Tune => self.reading.map(|r| r.target.midi),
+        };
+        let (name, octave) = match midi {
+            Some(m) if self.settings.mode == Mode::Sing => {
+                let s = music::spell(m, self.key());
+                (s.name(), s.octave.to_string())
+            }
+            Some(m) => (music::name(m, self.flats()).to_string(), music::octave(m).to_string()),
+            None => (" ".to_string(), String::new()),
         };
         let color = match (self.live, self.needle) {
             (true, Some(n)) if n.abs() <= zone => hex(OK, 1.0),
@@ -505,16 +657,20 @@ impl Monitor {
         let n = self.needle.unwrap_or(0.0);
         let color = if self.live { Class::of(n, zone, near).color() } else { white(0.28) };
         let tuning = self.settings.mode == Mode::Tune;
+        let aiming = tuning || self.target.is_some();
         let hint = match () {
-            _ if !self.live || !tuning => "",
-            _ if n.abs() <= zone => "in tune",
-            _ if n < 0.0 => "tune up ↑",
-            _ => "tune down ↓",
+            _ if !self.live || !aiming => "",
+            _ if n.abs() <= zone && tuning => "in tune",
+            _ if n.abs() <= zone => "on it",
+            _ if n < 0.0 && tuning => "tune up ↑",
+            _ if n < 0.0 => "sing higher ↑",
+            _ if tuning => "tune down ↓",
+            _ => "sing lower ↓",
         };
-        let target_hz = self.settings.a4 * 2f32.powf((r.target.midi as f32 - 69.0) / 12.0);
+        let target_hz = music::hz_of(r.target.midi, self.settings.a4);
         line.child(div().text_size(px(big)).text_color(color).child(fmt_cents(n)))
             .child(div().text_size(px(big * 0.6)).text_color(white(if self.live { 0.6 } else { 0.28 })).child(format!("{:.1} Hz", r.hz)))
-            .when(tuning, |d| d.child(div().text_size(px(big * 0.5)).text_color(white(0.35)).child(format!("→ {target_hz:.1} Hz"))))
+            .when(aiming, |d| d.child(div().text_size(px(big * 0.5)).text_color(white(0.35)).child(format!("→ {target_hz:.1} Hz"))))
             .child(div().text_size(px(big * 0.55)).text_color(color).child(hint))
     }
 
@@ -661,13 +817,41 @@ impl Monitor {
             .child(label("−50¢").bottom(px(4.)))
     }
 
-    fn sing_view(&self) -> impl IntoElement {
+    fn sing_view(&self, cx: &Context<Self>) -> impl IntoElement {
+        let sung = Sung::new(&self.frames, self.now, self.settings.a4, self.live);
+        let target = self.target.map(|m| {
+            let s = music::spell(m, self.key());
+            div()
+                .id("target")
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .bg(white(0.06))
+                .hover(|s| s.bg(white(0.1)))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(white(0.6))
+                .child(format!("Target {}{}", s.name(), s.octave))
+                .child(div().font_family(MONO_FONT).child("✕"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.clear_target();
+                    cx.notify();
+                }))
+        });
         let readout = div()
-            .w(px(250.))
+            .w(px(260.))
             .flex()
             .flex_col()
+            .child(div().h(px(22.)).flex().children(target))
             .child(self.note(84.0, SING_ZONE))
             .child(self.cents_line(SING_ZONE, SING_NEAR, 22.0));
+        let view = match self.settings.sing_view {
+            SingView::Staff => self.staff(&sung).into_any_element(),
+            SingView::Roll => self.piano_roll(&sung).into_any_element(),
+        };
         div()
             .flex_1()
             .min_h(px(0.))
@@ -683,22 +867,19 @@ impl Monitor {
                     .child(readout)
                     .child(div().flex_1().child(gauge(self.needle, self.live, SING_ZONE, SING_NEAR, 40.0))),
             )
-            .child(self.piano_roll())
+            .child(view)
+            .child(self.keyboard(&sung, cx))
     }
 
     /// The pitch over the last seconds on a piano roll, newest at the right; the row of the
     /// note being sung lights up.
-    fn piano_roll(&self) -> impl IntoElement {
+    fn piano_roll(&self, sung: &Sung) -> impl IntoElement {
         let (now, span) = (self.now, self.settings.span);
         let (lo, hi) = (self.center - span / 2.0, self.center + span / 2.0);
         let current = self.reading.filter(|_| self.live).map(|r| r.target.midi);
-        let points: Vec<(f64, Option<f32>)> = self
-            .frames
-            .iter()
-            .filter(|f| f.t >= now - SING_SECS - 0.05)
-            .map(|f| (f.t, f.hz.map(|hz| self.midi(hz))))
-            .collect();
-        let classes = sing_classes(&points);
+        let target = self.target;
+        let points = sung.points.clone();
+        let classes = sung.classes.clone();
         let rows = (lo.floor() as i32)..=(hi.ceil() as i32);
         // Every natural note, or only the Cs when the rows get thin.
         let labels: Vec<(i32, f32)> = rows
@@ -737,6 +918,9 @@ impl Monitor {
                         window.paint_quad(fill(Bounds { origin: point(x, b.origin.y), size: size(px(1.), b.size.height) }, white(0.035)));
                     }
                 });
+                if let Some(m) = target {
+                    paint_target_line(window, point(b.origin.x, y_of(m as f32)), b.size.width);
+                }
 
                 let mut runs = Runs::default();
                 let mut prev: Option<(f64, f32)> = None;
@@ -762,11 +946,7 @@ impl Monitor {
                 if let Some(&(t, Some(m))) = points.last() {
                     if now - t < LIVE && (lo..=hi).contains(&m) {
                         let color = classes.last().map_or(white(1.0), |c| c.color());
-                        let at = point(x_of(t), y_of(m));
-                        for (r, a) in [(px(11.), 0.18), (px(5.), 1.0)] {
-                            let dot = Bounds { origin: point(at.x - r, at.y - r), size: size(r * 2.0, r * 2.0) };
-                            window.paint_quad(fill(dot, color.opacity(a)).corner_radii(r));
-                        }
+                        paint_dot(window, point(x_of(t), y_of(m)), color);
                     }
                 }
             },
@@ -797,6 +977,225 @@ impl Monitor {
             }))
     }
 
+    /// The pitch on a tenor's treble-8 staff: the clef and key signature on the left, then
+    /// time running to the right edge. Each held note gets a note head where it's written,
+    /// with its accidental and ledger lines; the pitch line runs through them.
+    fn staff(&self, sung: &Sung) -> impl IntoElement {
+        let key = self.key();
+        let signature = key.signature();
+        let (range, now) = (self.staff_range, self.now);
+        let heads: Vec<Head> = sung
+            .notes
+            .iter()
+            .map(|n| Head {
+                start: n.start,
+                step: music::staff_position(n.midi as f32, key),
+                class: Class::of(n.cents, SING_ZONE, SING_NEAR),
+                live: n.live,
+            })
+            .collect();
+        let trace: Vec<TracePoint> = sung
+            .points
+            .iter()
+            .zip(&sung.classes)
+            .map(|(&(t, m), &c)| (t, m.map(|m| (m, music::staff_position(m, key))), c))
+            .collect();
+        let target = self.target.map(|m| music::staff_position(m as f32, key));
+
+        let laid_out = self.staff_bounds.clone();
+        let paint_heads = heads.clone();
+        let signature = signature.clone();
+        let paint = canvas(
+            move |b, _, _| laid_out.set(b),
+            move |b, _, window, _| {
+                let g = StaffGeom::new(b.size, range, signature.len(), now);
+                let space = g.space();
+                let at = |x: f32, y: f32| point(b.origin.x + px(x), b.origin.y + px(y));
+                let rect = |x: f32, y: f32, w: f32, h: f32| Bounds { origin: at(x, y), size: size(px(w), px(h)) };
+                paint_glyph(window, &glyphs::G_CLEF, at(CLEF_LEFT, g.y(CLEF_STEP)), space, (1.0, 1.0), white(0.75));
+                let mut x = g.signature_left();
+                for &(step, sign) in &signature {
+                    let (glyph, scale) = (accidental_glyph(sign), accidental_scale(sign));
+                    paint_glyph(window, glyph, at(x, g.y(step as f32)), space, scale, white(0.75));
+                    x += glyph_width(glyph, space, scale.0) + SIGNATURE_GAP * space;
+                }
+                window.paint_layer(b, |window| {
+                    for &line in &music::STAFF_LINES {
+                        window.paint_quad(fill(rect(10.0, g.y(line as f32) - 0.75, g.w - 10.0, 1.5), white(0.4)));
+                    }
+                    for s in ((now - SING_SECS).ceil() as i64)..=(now.floor() as i64) {
+                        let x = g.x(s as f64);
+                        if x > g.margin {
+                            window.paint_quad(fill(rect(x, 0.0, 1.0, g.h), white(0.03)));
+                        }
+                    }
+                });
+                let time = rect(g.margin, 0.0, g.w - g.margin, g.h);
+                window.with_content_mask(Some(ContentMask { bounds: time }), |window| {
+                    if let Some(step) = target {
+                        paint_target_line(window, at(g.margin, g.y(step)), px(g.w - g.margin));
+                    }
+                    window.paint_layer(time, |window| {
+                        let reach = 1.9 * head_radii(space).0;
+                        for h in &paint_heads {
+                            let x = g.head_x(h.start);
+                            // A head between steps takes the ledger lines of the step further out.
+                            let step = if h.step < music::STAFF_LINES[0] as f32 { h.step.floor() } else { h.step.ceil() };
+                            for line in music::ledger_lines(step as i32) {
+                                window.paint_quad(fill(rect(x - reach, g.y(line as f32) - 0.75, 2.0 * reach, 1.5), white(0.4)));
+                            }
+                        }
+                    });
+
+                    let mut runs = Runs::default();
+                    let mut prev: Option<(f64, f32)> = None;
+                    for &(t, p, class) in &trace {
+                        match p {
+                            Some((m, step)) if (g.lo..=g.hi).contains(&step) => {
+                                if prev.is_some_and(|(pt, pm)| t - pt > 0.03 || (m - pm).abs() > 2.0) {
+                                    runs.gap();
+                                }
+                                runs.push(at(g.x(t), g.y(step)), class);
+                                prev = Some((t, m));
+                            }
+                            _ => {
+                                runs.gap();
+                                prev = None;
+                            }
+                        }
+                    }
+                    runs.paint(window, 2.5);
+
+                    let (rx, ry) = head_radii(space);
+                    for h in &paint_heads {
+                        let centre = at(g.head_x(h.start), g.y(h.step));
+                        let color = h.class.color();
+                        if h.live {
+                            if let Some(glow) = note_head(centre, 1.7 * rx, 1.7 * ry) {
+                                window.paint_path(glow, color.opacity(0.18));
+                            }
+                        }
+                        if let Some(head) = note_head(centre, rx, ry) {
+                            window.paint_path(head, color.opacity(if h.live { 1.0 } else { 0.85 }));
+                        }
+                    }
+                    if let Some(&(t, Some((_, step)), class)) = trace.last() {
+                        if now - t < LIVE {
+                            paint_dot(window, at(g.x(t), g.y(step)), class.color());
+                        }
+                    }
+                });
+            },
+        )
+        .size_full();
+
+        // The clef's little 8 is text, so a div over the canvas (text in a canvas makes other
+        // text flicker), placed from last frame's layout.
+        let g = StaffGeom::new(self.staff_bounds.get().size, range, key.signature().len(), now);
+        let space = g.space();
+        let eight = (space > 2.0).then(|| {
+            div()
+                .absolute()
+                .left(px(CLEF_LEFT + glyph_width(&glyphs::G_CLEF, space, 1.0) * 0.52 - space / 2.0))
+                .top(px(g.y(CLEF_STEP) + CLEF_EIGHT * space))
+                .w(px(space))
+                .flex()
+                .justify_center()
+                .text_size(px(0.95 * space))
+                .line_height(px(space))
+                .text_color(white(0.75))
+                .child("8")
+        });
+
+        div()
+            .relative()
+            .flex_1()
+            .w_full()
+            .min_h(px(160.))
+            .rounded(px(12.))
+            .overflow_hidden()
+            .bg(white(0.015))
+            .child(paint)
+            .children(eight)
+    }
+
+    /// A keyboard from a baritone's low F to a tenor's high C: click a key to hear it and
+    /// sing against it. The key being sung lights up in how close it is.
+    fn keyboard(&self, sung: &Sung, cx: &Context<Self>) -> impl IntoElement {
+        let singing = sung.now_singing().filter(|_| self.live);
+        let pressed = self.pressed.filter(|(_, at)| at.elapsed() < PRESS).map(|(m, _)| m);
+        let target = self.target;
+        let whites: Vec<i32> = (piano::LOW..=piano::HIGH).filter(|&m| !music::is_black(m)).collect();
+        let n = whites.len() as f32;
+        let fill_of = |m: i32, black: bool| match () {
+            _ if singing.is_some_and(|(s, _)| s == m) => singing.map(|(_, c)| c.color()).unwrap(),
+            _ if pressed == Some(m) => white(if black { 0.4 } else { 0.62 }),
+            _ if black => hex(0x1d1d1d, 1.0),
+            _ => white(0.86),
+        };
+        let marker = |m: i32, black: bool| {
+            (target == Some(m)).then(|| div().size(px(8.)).mb(px(2.)).rounded_full().bg(if black { white(0.85) } else { hex(BG, 0.85) }))
+        };
+        let press = |m: i32| {
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                this.press(m);
+                cx.notify();
+            })
+        };
+        let white_keys = whites.iter().map(|&m| {
+            div()
+                .id(("white-key", m as usize))
+                .flex_1()
+                .h_full()
+                .rounded_bl(px(5.))
+                .rounded_br(px(5.))
+                .bg(fill_of(m, false))
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .items_center()
+                .pb(px(5.))
+                .children(marker(m, false))
+                .when(m.rem_euclid(12) == 0, |d| {
+                    d.child(div().text_size(px(10.)).text_color(hex(BG, 0.6)).child(format!("C{}", music::octave(m))))
+                })
+                .on_mouse_down(MouseButton::Left, press(m))
+        });
+        let black_keys = (piano::LOW..=piano::HIGH).filter(|&m| music::is_black(m)).map(|m| {
+            // Centred on the line between the white keys either side.
+            let whites_below = whites.iter().filter(|&&w| w < m).count() as f32;
+            div()
+                .id(("black-key", m as usize))
+                .absolute()
+                .top_0()
+                .left(relative((whites_below - 0.3) / n))
+                .w(relative(0.6 / n))
+                .h(relative(0.6))
+                .rounded_bl(px(4.))
+                .rounded_br(px(4.))
+                .border_1()
+                .border_color(white(0.1))
+                .bg(fill_of(m, true))
+                .cursor_pointer()
+                .occlude()
+                .flex()
+                .flex_col()
+                .justify_end()
+                .items_center()
+                .pb(px(4.))
+                .children(marker(m, true))
+                .on_mouse_down(MouseButton::Left, press(m))
+        });
+        div()
+            .relative()
+            .w_full()
+            .h(px(86.))
+            .flex_none()
+            .child(div().size_full().flex().gap(px(2.)).children(white_keys))
+            .children(black_keys)
+    }
+
     fn footer(&self) -> impl IntoElement {
         let status = if let Some(e) = &self.error {
             Some((format!("No audio input: {e}"), hex(DANGER, 1.0)))
@@ -809,7 +1208,10 @@ impl Monitor {
         };
         let hints = match self.settings.mode {
             Mode::Tune => "Tab sing · T tuning · 1–6 lock a string, 0 nearest · ↑↓ A4 · Space pause · Q quit",
-            Mode::Sing => "Tab tune · Scroll or [ ] zoom · ↑↓ A4 · Space pause · Q quit",
+            Mode::Sing => match self.settings.sing_view {
+                SingView::Staff => "Tab tune · V roll · K key · click the piano to hear a note, X clears it · ↑↓ A4 · Space pause · Q quit",
+                SingView::Roll => "Tab tune · V staff · K key · Scroll or [ ] zoom · click the piano to hear a note, X clears it · Space pause · Q quit",
+            },
         };
         div()
             .flex()
@@ -830,7 +1232,7 @@ impl Render for Monitor {
         }
         let body = match self.settings.mode {
             Mode::Tune => self.tune_view(cx).into_any_element(),
-            Mode::Sing => self.sing_view().into_any_element(),
+            Mode::Sing => self.sing_view(cx).into_any_element(),
         };
         div()
             .track_focus(&self.focus)
@@ -981,12 +1383,12 @@ impl Runs {
     }
 }
 
-/// How close each sung frame is to a note, judged on the pitch averaged over about a
-/// vibrato cycle (`SING_SMOOTH` frames either side, within the same note).
-fn sing_classes(points: &[(f64, Option<f32>)]) -> Vec<Class> {
+/// The pitch averaged over about a vibrato cycle (`SING_SMOOTH` frames either side, within
+/// the same note), per frame.
+fn smooth(points: &[(f64, Option<f32>)]) -> Vec<Option<f32>> {
     (0..points.len())
         .map(|i| {
-            let Some(m) = points[i].1 else { return Class::Off };
+            let m = points[i].1?;
             let (mut sum, mut n) = (m, 1.0);
             for dir in [-1isize, 1] {
                 for k in 1..=SING_SMOOTH as isize {
@@ -999,10 +1401,266 @@ fn sing_classes(points: &[(f64, Option<f32>)]) -> Vec<Class> {
                     }
                 }
             }
-            let avg = sum / n;
-            Class::of((avg - avg.round()) * 100.0, SING_ZONE, SING_NEAR)
+            Some(sum / n)
         })
         .collect()
+}
+
+/// How close each sung frame is to a note, judged on the smoothed pitch, so a note with
+/// even vibrato around it still counts as on it.
+fn sing_classes(smoothed: &[Option<f32>]) -> Vec<Class> {
+    smoothed.iter().map(|s| s.map_or(Class::Off, |m| Class::of((m - m.round()) * 100.0, SING_ZONE, SING_NEAR))).collect()
+}
+
+/// A held note found in the pitch: its time, the semitone it's nearest, how far off on
+/// average, and whether it's still being sung.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Held {
+    start: f64,
+    end: f64,
+    midi: i32,
+    cents: f32,
+    live: bool,
+}
+
+/// Runs where the smoothed pitch stays within `NOTE_STICK` of the semitone it started
+/// nearest, held at least `MIN_NOTE`. Glides and blips between them are dropped, and a note
+/// broken briefly (a dropout) is joined back up. Each is named, and its tuning judged, on
+/// its middle: the glide into and out of it is left out.
+fn held_notes(points: &[(f64, Option<f32>)], smoothed: &[Option<f32>]) -> Vec<Held> {
+    // (note so far, named after where it started; its pitch frame by frame)
+    let mut runs: Vec<(Held, Vec<f32>)> = Vec::new();
+    let mut last: Option<f64> = None;
+    for (&(t, raw), &avg) in points.iter().zip(smoothed) {
+        let (Some(raw), Some(avg)) = (raw, avg) else {
+            last = None;
+            continue;
+        };
+        match runs.last_mut() {
+            Some((h, pitch)) if (avg - h.midi as f32).abs() < NOTE_STICK && last.is_some_and(|l| t - l <= 0.035) => {
+                h.end = t;
+                pitch.push(raw);
+            }
+            _ => runs.push((Held { start: t, end: t, midi: avg.round() as i32, cents: 0.0, live: false }, vec![raw])),
+        }
+        last = Some(t);
+    }
+    // The middle of a run: without the smoothing's reach at either end, if that leaves enough.
+    let middle_mean = |pitch: &[f32]| {
+        let trim = if pitch.len() > 4 * SING_SMOOTH { SING_SMOOTH } else { 0 };
+        let middle = &pitch[trim..pitch.len() - trim];
+        middle.iter().sum::<f32>() / middle.len() as f32
+    };
+    let mut notes: Vec<(Held, Vec<f32>)> = Vec::new();
+    for (mut h, pitch) in runs.into_iter().filter(|(h, _)| h.end - h.start >= MIN_NOTE) {
+        h.midi = middle_mean(&pitch).round() as i32;
+        match notes.last_mut() {
+            Some((p, ppitch)) if p.midi == h.midi && h.start - p.end <= NOTE_JOIN => {
+                p.end = h.end;
+                ppitch.extend(pitch);
+            }
+            _ => notes.push((h, pitch)),
+        }
+    }
+    notes
+        .into_iter()
+        .map(|(mut h, pitch)| {
+            h.cents = (middle_mean(&pitch) - h.midi as f32) * 100.0;
+            h
+        })
+        .collect()
+}
+
+/// What the sing views draw, worked out once a frame: per frame its time, the pitch (MIDI)
+/// when voiced, the smoothed pitch and its colour; and the held notes.
+struct Sung {
+    points: Vec<(f64, Option<f32>)>,
+    smoothed: Vec<Option<f32>>,
+    classes: Vec<Class>,
+    notes: Vec<Held>,
+}
+
+impl Sung {
+    fn new(frames: &[Frame], now: f64, a4: f32, live: bool) -> Self {
+        // A second before the view, so a note already under way when it enters is known.
+        let points: Vec<(f64, Option<f32>)> = frames
+            .iter()
+            .filter(|f| f.t >= now - SING_SECS - 1.0)
+            .map(|f| (f.t, f.hz.map(|hz| music::midi_of(hz, a4))))
+            .collect();
+        let smoothed = smooth(&points);
+        let classes = sing_classes(&smoothed);
+        let mut notes = held_notes(&points, &smoothed);
+        let newest = points.last().filter(|p| p.1.is_some()).map(|p| p.0);
+        if let (true, Some(newest), Some(last)) = (live, newest, notes.last_mut()) {
+            last.live = last.end >= newest - 0.02;
+        }
+        Self { points, smoothed, classes, notes }
+    }
+
+    /// The note being sung right now, and how close.
+    fn now_singing(&self) -> Option<(i32, Class)> {
+        let m = (*self.smoothed.last()?)?;
+        Some((m.round() as i32, *self.classes.last()?))
+    }
+}
+
+/// A frame of the staff's pitch line: time, (pitch, staff position) when voiced, colour.
+type TracePoint = (f64, Option<(f32, f32)>, Class);
+
+/// A note head to draw: where and when, its colour, and whether it's sounding.
+#[derive(Clone, Copy)]
+struct Head {
+    start: f64,
+    /// Where the pitch line puts its semitone: on a line or space for notes in the key,
+    /// between them for the rest (no accidentals: the user found them clutter).
+    step: f32,
+    class: Class,
+    live: bool,
+}
+
+/// The clef's left edge (px), and the line it curls round: G3 on treble-8.
+const CLEF_LEFT: f32 = 16.0;
+const CLEF_STEP: f32 = 25.0;
+/// Where the clef's little 8 starts, in spaces below the G line: just under its tail.
+const CLEF_EIGHT: f32 = 2.75;
+/// Noto Music's accidentals are drawn for text: big beside its staff, and its sharp is
+/// wide. These (x, y) scales bring them to engraving size and shape, narrow enough to fit
+/// between notes sung in quick succession.
+fn accidental_scale(sign: Accidental) -> (f32, f32) {
+    match sign {
+        Accidental::Sharp => (0.45, 0.7),
+        Accidental::Flat => (0.7, 0.7),
+        Accidental::Natural => (0.55, 0.7),
+    }
+}
+/// Space between the key signature's accidentals, in staff spaces.
+const SIGNATURE_GAP: f32 = 0.2;
+/// A note head's half width and half height (px) for `space` px a staff space: well under
+/// sheet-music size (a full staff space high looked like blobs), and no wider than a small
+/// dot on a big window.
+fn head_radii(space: f32) -> (f32, f32) {
+    let rx = (0.3 * space).min(12.0);
+    (rx, 0.72 * rx)
+}
+
+fn accidental_glyph(sign: Accidental) -> &'static glyphs::Glyph {
+    match sign {
+        Accidental::Sharp => &glyphs::SHARP,
+        Accidental::Flat => &glyphs::FLAT,
+        Accidental::Natural => &glyphs::NATURAL,
+    }
+}
+
+/// A glyph's width in px at `space` px a staff space, scaled across by `sx`.
+fn glyph_width(glyph: &glyphs::Glyph, space: f32, sx: f32) -> f32 {
+    glyph.width * sx * space / glyphs::SPACE
+}
+
+/// Fills a staff glyph with its anchor (left edge, at the height of its line or space) at
+/// `at`, sized for `space` px a staff space and scaled by `(sx, sy)`.
+fn paint_glyph(window: &mut Window, glyph: &glyphs::Glyph, at: Point<Pixels>, space: f32, (sx, sy): (f32, f32), color: Hsla) {
+    let (kx, ky) = (sx * space / glyphs::SPACE, sy * space / glyphs::SPACE);
+    let p = |x: f32, y: f32| point(at.x + px((x - glyph.anchor.0) * kx), at.y - px((y - glyph.anchor.1) * ky));
+    let mut path = PathBuilder::fill();
+    for seg in glyph.segs {
+        match *seg {
+            glyphs::Seg::M(x, y) => path.move_to(p(x, y)),
+            glyphs::Seg::L(x, y) => path.line_to(p(x, y)),
+            glyphs::Seg::Q(cx, cy, x, y) => path.curve_to(p(x, y), p(cx, cy)),
+            glyphs::Seg::Z => path.close(),
+        }
+    }
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Where things go on the staff panel, from its size: the steps `lo..hi` top to bottom, the
+/// clef and key signature in a margin on the left, and time from the margin to the right
+/// edge (now).
+#[derive(Clone, Copy)]
+struct StaffGeom {
+    w: f32,
+    h: f32,
+    lo: f32,
+    hi: f32,
+    margin: f32,
+    now: f64,
+}
+
+impl StaffGeom {
+    fn new(size: Size<Pixels>, (lo, hi): (f32, f32), signature: usize, now: f64) -> Self {
+        let (w, h) = (f32::from(size.width), f32::from(size.height));
+        let mut g = Self { w, h, lo, hi, margin: 0.0, now };
+        // Key signatures are all sharps or all flats; the widest glyph sets the pitch.
+        let widest = [Accidental::Sharp, Accidental::Flat].map(|s| glyph_width(accidental_glyph(s), g.space(), accidental_scale(s).0));
+        let each = widest[0].max(widest[1]) + SIGNATURE_GAP * g.space();
+        g.margin = g.signature_left() + each * signature as f32 + 0.8 * g.space();
+        g
+    }
+
+    /// Where the key signature starts, after the clef.
+    fn signature_left(&self) -> f32 {
+        CLEF_LEFT + glyph_width(&glyphs::G_CLEF, self.space(), 1.0) + 0.4 * self.space()
+    }
+
+    /// The distance between two staff lines.
+    fn space(&self) -> f32 {
+        2.0 * self.h / (self.hi - self.lo)
+    }
+
+    fn y(&self, step: f32) -> f32 {
+        self.h * (self.hi - step) / (self.hi - self.lo)
+    }
+
+    fn x(&self, t: f64) -> f32 {
+        self.margin + (self.w - self.margin) * (1.0 - ((self.now - t) / SING_SECS) as f32)
+    }
+
+    /// A note head's centre for a note starting at `t`: its left edge on the onset.
+    fn head_x(&self, t: f64) -> f32 {
+        self.x(t) + head_radii(self.space()).0
+    }
+}
+
+/// A filled note head: an oval with these half width and height, tilted up to the right.
+fn note_head(centre: Point<Pixels>, rx: f32, ry: f32) -> Option<Path<Pixels>> {
+    let (sin, cos) = (-0.35f32).sin_cos();
+    let points: Vec<Point<Pixels>> = (0..28)
+        .map(|i| {
+            let a = std::f32::consts::TAU * i as f32 / 28.0;
+            let (ex, ey) = (rx * a.cos(), ry * a.sin());
+            point(centre.x + px(ex * cos - ey * sin), centre.y + px(ex * sin + ey * cos))
+        })
+        .collect();
+    let mut path = PathBuilder::fill();
+    path.add_polygon(&points, true);
+    path.build().ok()
+}
+
+/// The piano's note: a dashed line across the view at its pitch.
+fn paint_target_line(window: &mut Window, from: Point<Pixels>, width: Pixels) {
+    let mut path = PathBuilder::stroke(px(1.5)).dash_array(&[px(7.), px(6.)]);
+    path.move_to(from);
+    path.line_to(point(from.x + width, from.y));
+    if let Ok(path) = path.build() {
+        window.paint_path(path, white(0.55));
+    }
+}
+
+/// The voice now: a glowing dot.
+fn paint_dot(window: &mut Window, at: Point<Pixels>, color: Hsla) {
+    for (r, a) in [(px(11.), 0.18), (px(5.), 1.0)] {
+        let dot = Bounds { origin: point(at.x - r, at.y - r), size: size(r * 2.0, r * 2.0) };
+        window.paint_quad(fill(dot, color.opacity(a)).corner_radii(r));
+    }
+}
+
+/// A scripted press, "seconds:midi".
+fn parse_press(s: &str) -> Option<(f64, i32)> {
+    let (at, midi) = s.split_once(':')?;
+    Some((at.parse().ok()?, midi.parse().ok()?))
 }
 
 fn main() {
@@ -1055,6 +1713,75 @@ mod tests {
         assert_eq!(r.runs[1].0[0], p(1.), "the new colour starts at the last point");
     }
 
+    /// Frames at 100 a second: (seconds, MIDI or rest) pieces laid end to end.
+    fn track_of(pieces: &[(f64, Option<f32>)]) -> Vec<(f64, Option<f32>)> {
+        let mut t = 0.0;
+        let mut out = Vec::new();
+        for &(secs, m) in pieces {
+            for _ in 0..(secs * 100.0).round() as usize {
+                out.push((t, m));
+                t += 0.01;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn held_notes_skip_blips_and_rejoin_a_note_broken_briefly() {
+        let points = track_of(&[
+            (0.4, Some(60.0)),
+            (0.05, Some(70.0)), // a blip
+            (0.4, Some(60.1)),
+            (0.2, None),
+            (0.3, Some(64.2)),
+            (0.03, None), // a dropout
+            (0.3, Some(64.2)),
+        ]);
+        let notes = held_notes(&points, &points.iter().map(|p| p.1).collect::<Vec<_>>());
+        let summary: Vec<(i32, i32)> = notes.iter().map(|n| (n.midi, n.cents.round() as i32)).collect();
+        assert_eq!(summary, [(60, 5), (64, 20)]);
+        assert!((notes[0].end - notes[0].start - 0.84).abs() < 0.02, "one note across the blip");
+    }
+
+    #[test]
+    fn a_voice_hovering_between_two_notes_stays_one_note() {
+        // G3 sung 35–65 cents flat, wandering slowly across the halfway mark to F♯3, as in
+        // the user's first try at matching the piano's G3.
+        let points: Vec<(f64, Option<f32>)> = (0..200)
+            .map(|i| {
+                let t = i as f64 / 100.0;
+                (t, Some(54.5 + 0.15 * (std::f64::consts::TAU * 1.3 * t).sin() as f32))
+            })
+            .collect();
+        let notes = held_notes(&points, &smooth(&points));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].midi, 55);
+        assert!((notes[0].cents + 50.0).abs() < 5.0, "{:.1} cents", notes[0].cents);
+        // A real change of note still starts a new one.
+        let steps = track_of(&[(0.5, Some(55.0)), (0.5, Some(57.0))]);
+        assert_eq!(held_notes(&steps, &smooth(&steps)).iter().map(|n| n.midi).collect::<Vec<_>>(), [55, 57]);
+    }
+
+    #[test]
+    fn the_test_voice_comes_out_as_its_tune() {
+        let mut synth = audio::Synth::new(audio::Signal::Voice);
+        let mut capture = audio::Capture::new(48_000);
+        let mut analyser = track::Analyser::new(48_000, 0);
+        let mut frames = Vec::new();
+        while capture.written < 48_000 * 12 {
+            for _ in 0..480 {
+                capture.push(synth.next());
+            }
+            frames.extend(analyser.take(&capture).into_iter().map(|w| analyser.analyse(w)));
+        }
+        let sung = Sung::new(&frames, 12.0, 440.0, false);
+        let notes: Vec<i32> = sung.notes.iter().map(|n| n.midi).collect();
+        // From 1 s in: G4 A4 G4, F4 E4 D4 C4, then G3 E3 C3 D3 E3 F♯3 G3 (repeats join up).
+        assert_eq!(notes, [67, 69, 67, 65, 64, 62, 60, 55, 52, 48, 50, 52, 54, 55]);
+        let a4 = sung.notes[1];
+        assert!((a4.cents - 14.0).abs() < 4.0, "A4 sung 18 then 10 cents sharp: {:.1}", a4.cents);
+    }
+
     #[test]
     fn vibrato_around_a_note_counts_as_on_it() {
         // ±40 cents of vibrato at 5.5 Hz around A4, sampled at 100 frames a second.
@@ -1064,11 +1791,11 @@ mod tests {
                 (t, Some(69.0 + 0.4 * (std::f64::consts::TAU * 5.5 * t).sin() as f32))
             })
             .collect();
-        let classes = sing_classes(&points);
+        let classes = sing_classes(&smooth(&points));
         let on = classes[20..180].iter().filter(|&&c| c == Class::On).count();
         assert!(on > 150, "only {on} of 160 frames on pitch");
         // Held 30 cents sharp is off.
         let sharp: Vec<(f64, Option<f32>)> = (0..50).map(|i| (i as f64 / 100.0, Some(69.3))).collect();
-        assert!(sing_classes(&sharp).iter().all(|&c| c == Class::Off));
+        assert!(sing_classes(&smooth(&sharp)).iter().all(|&c| c == Class::Off));
     }
 }

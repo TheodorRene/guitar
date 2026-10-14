@@ -14,6 +14,7 @@ use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
 use spa::pod::Pod;
 
+use crate::piano;
 use crate::pitch::Lowpass;
 
 /// Mono samples of history kept: well over the analysis window, so the analysis thread can
@@ -98,16 +99,26 @@ impl Capture {
 
 pub type Shared = Arc<Mutex<Capture>>;
 
-/// Starts capturing on a background thread that owns the PipeWire main loop. With
-/// `GUITAR_TEST_SIGNAL=guitar` or `=voice` it makes up a signal instead (see `Synth`).
-pub fn start() -> Shared {
+/// The test signal asked for with `GUITAR_TEST_SIGNAL` (`guitar`, `voice` or `quiet`).
+pub fn test_signal() -> Option<String> {
+    std::env::var("GUITAR_TEST_SIGNAL").ok().filter(|v| !v.is_empty() && v != "0")
+}
+
+/// Starts capturing on a background thread that owns the PipeWire main loop. With a test
+/// signal it makes one up instead (see `Synth`), and mixes the piano's `voices` into it as
+/// if the microphone heard them.
+pub fn start(voices: piano::Voices) -> Shared {
     let shared = Arc::new(Mutex::new(Capture::new(48_000)));
     let thread_shared = shared.clone();
-    if let Some(kind) = std::env::var("GUITAR_TEST_SIGNAL").ok().filter(|v| !v.is_empty() && v != "0") {
-        let signal = if kind == "guitar" { Signal::Guitar } else { Signal::Voice };
+    if let Some(kind) = test_signal() {
+        let signal = match kind.as_str() {
+            "guitar" => Signal::Guitar,
+            "quiet" => Signal::Quiet,
+            _ => Signal::Voice,
+        };
         thread::Builder::new()
             .name("test-signal".into())
-            .spawn(move || synthesize(thread_shared, signal))
+            .spawn(move || synthesize(thread_shared, signal, voices))
             .expect("failed to spawn test signal thread");
         return shared;
     }
@@ -208,18 +219,21 @@ fn run(shared: Shared) -> Result<()> {
     Ok(())
 }
 
-/// Feeds the capture from a `Synth` in real time, in PipeWire-sized chunks.
-fn synthesize(shared: Shared, signal: Signal) {
+/// Feeds the capture from a `Synth`, plus the piano, in real time in PipeWire-sized chunks.
+fn synthesize(shared: Shared, signal: Signal, voices: piano::Voices) {
     const CHUNK: u64 = 480;
     let mut synth = Synth::new(signal);
+    let mut heard = vec![0.0; CHUNK as usize];
     let start = Instant::now();
     let mut n = 0u64;
     loop {
         let due = start + Duration::from_secs_f64((n + CHUNK) as f64 / Synth::RATE as f64);
         thread::sleep(due.saturating_duration_since(Instant::now()));
+        heard.fill(0.0);
+        piano::render(&mut voices.lock().unwrap(), &mut heard);
         let mut capture = shared.lock().unwrap();
-        for _ in 0..CHUNK {
-            capture.push(synth.next());
+        for &h in &heard {
+            capture.push(synth.next() + h);
         }
         n += CHUNK;
         capture.received = true;
@@ -230,12 +244,14 @@ fn synthesize(shared: Shared, signal: Signal) {
 pub enum Signal {
     Guitar,
     Voice,
+    /// Just the hiss: for trying the piano.
+    Quiet,
 }
 
 /// A made-up input in place of the microphone, for tests and screenshots: silent, and the
 /// same picture every run. `Guitar` plucks each open string of standard tuning in turn,
 /// some of them out of tune; `Voice` sings a phrase with vibrato and glides, a few notes
-/// sharp or flat, with rests between lines. Both over a little hiss.
+/// sharp or flat, with rests between lines; `Quiet` is just the hiss they all have.
 pub struct Synth {
     signal: Signal,
     n: u64,
@@ -265,6 +281,7 @@ impl Synth {
                 self.phase = (self.phase + hz / Self::RATE as f64).fract();
                 amp * voice_wave(self.phase)
             }
+            Signal::Quiet => 0.0,
         };
         self.seed ^= self.seed << 13;
         self.seed ^= self.seed >> 17;
@@ -278,6 +295,7 @@ impl Synth {
         match self.signal {
             Signal::Guitar => plucked(t).map_or((0.0, 0.0), |(hz, since)| (hz, (-since * 1.3).exp() as f32)),
             Signal::Voice => sung(t),
+            Signal::Quiet => (0.0, 0.0),
         }
     }
 }
@@ -310,13 +328,15 @@ fn pluck(t: f64) -> f32 {
     (0.18 * attack * sum) as f32
 }
 
-/// The sung pitch (Hz) and loudness at `t`: "Twinkle twinkle" in C, half a second a note,
+/// The sung pitch (Hz) and loudness at `t`: "Twinkle twinkle" in C, then a tenor's line
+/// down to a low C (a ledger line on treble-8) and back up through F♯, half a second a note,
 /// gliding into each, with vibrato after the onset, and a rest after each line.
 fn sung(t: f64) -> (f64, f32) {
     // (MIDI, cents off) per note; 0 = rest.
-    const TUNE: [(f64, f64); 16] = [
+    const TUNE: [(f64, f64); 24] = [
         (60.0, 0.0), (60.0, 5.0), (67.0, -8.0), (67.0, 0.0), (69.0, 18.0), (69.0, 10.0), (67.0, 0.0), (0.0, 0.0),
         (65.0, -25.0), (65.0, -5.0), (64.0, 0.0), (64.0, 3.0), (62.0, -12.0), (62.0, 0.0), (60.0, 2.0), (0.0, 0.0),
+        (55.0, 0.0), (52.0, 4.0), (48.0, -6.0), (50.0, 0.0), (52.0, 8.0), (54.0, -3.0), (55.0, 0.0), (0.0, 0.0),
     ];
     const NOTE: f64 = 0.5;
     let pos = t % (NOTE * TUNE.len() as f64);
