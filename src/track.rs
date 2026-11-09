@@ -271,4 +271,32 @@ mod tests {
             assert!(read.iter().all(|&f| cents(f, hz).abs() < 0.5), "{hz} Hz read as {:?}", &read[..3]);
         }
     }
+
+    #[test]
+    fn the_voice_reads_true_over_a_drone_leaking_into_the_microphone() {
+        // A drone an octave under the tune's start, 18 dB down on the piano's own level:
+        // far more than open-back headphones leak into a laptop's microphone. (At -6 dB
+        // the drone wins.) In the rests the drone reads as sung: there it's all there is.
+        let voices = crate::piano::Voices::default();
+        let mut piano = crate::piano::Piano::new(voices.clone(), std::sync::Arc::new(std::sync::Mutex::new(Capture::new(Synth::RATE))), false);
+        piano.set_hold(true);
+        piano.play(130.81);
+        let mut synth = Synth::new(Signal::Voice);
+        let mut leak = Vec::new();
+        let frames = readings(
+            || {
+                if leak.is_empty() {
+                    leak.resize(480, 0.0);
+                    crate::piano::render(&mut voices.lock().unwrap(), &mut leak);
+                }
+                synth.next() + 0.125 * leak.pop().unwrap()
+            },
+            12.0,
+        );
+        let truth = Synth::new(Signal::Voice);
+        let late = 1.0 / FRAMES_PER_SEC as f64;
+        let sung: Vec<_> = frames.iter().filter(|(t, _)| *t > 1.0 && truth.truth(*t).1 > 0.2).collect();
+        let right = sung.iter().filter(|&&&(t, hz)| hz.is_some_and(|h| cents(h, truth.truth(t - late).0).abs() < 10.0)).count();
+        assert!(right * 10 >= sung.len() * 9, "{right} of {} sung frames read right", sung.len());
+    }
 }

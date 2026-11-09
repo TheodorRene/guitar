@@ -3,14 +3,15 @@
 # (GUITAR_TEST_SIGNAL) with scratch settings. Nothing appears on the user's screen, the
 # microphone isn't opened, and their settings aren't touched.
 #
-#   tools/gui-headless.sh [-m tune|sing] [-g guitar|voice|quiet|mic] [-r WxH] [-t seconds]
+#   tools/gui-headless.sh [-m tune|sing|warmup|circle] [-g guitar|voice|warmup|quiet|mic] [-r WxH] [-t seconds]
 #                         [-s shot-at-seconds] [-e 'json'] [-p 'secs:midi …'] [-o dir] [binary]
 #
-# -m picks the view; -g the test signal (`quiet` is only hiss, for the piano; `mic` the real
+# -m picks the view; -g the test signal (`warmup` sings the five-note warm-up, started by
+# `-p 1:enter`; `quiet` is only hiss, for the piano; `mic` the real
 # default input); -r the output size (the window tiles to fill it; default 1920x1170 like the
 # user's panel); -e adds settings fields, e.g. -e '"key": "G"'; -p presses piano keys at
-# those times, e.g. -p '2:57' for A3 (GUITAR_TEST_PRESS; the headless sway has no pointer
-# to click with). With a test signal the piano is silent: its notes go into the made-up
+# those times, e.g. -p '2:57' for A3, and keys, '2:m' down and '2.5:^m' up (GUITAR_TEST_PRESS;
+# the headless sway has no pointer or keyboard). With a test signal the piano is silent: its notes go into the made-up
 # input instead, as if the microphone heard them.
 # The binary defaults to ./target/release/guitar, which needs the dev shell: run this under
 # `nix develop -c`.

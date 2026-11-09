@@ -16,6 +16,7 @@ FONT = "/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf"
 # (const name, code point, anchor y: the height that goes on the note's line or space)
 GLYPHS = [
     ("G_CLEF", 0x1D11E, 256.0),  # the G line of Noto Music's own staff (U+1D11A)
+    ("F_CLEF", 0x1D122, 644.5),  # midway between its dots: the F line (it sits lower than U+1D11A's)
     ("SHARP", 0x266F, None),  # centred
     ("NATURAL", 0x266E, None),  # centred
     ("FLAT", 0x266D, 112.5),  # the middle of the bowl's hole

@@ -89,6 +89,16 @@ impl Capture {
         true
     }
 
+    /// Copies the input as it came in, the samples that end `end` samples in, oldest first;
+    /// false if they aren't all held. For hearing yourself (`piano::Ear`).
+    pub fn raw_ending(&self, end: u64, out: &mut [f32]) -> bool {
+        let Some(start) = self.start_of(end, out.len()) else { return false };
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = self.raw[(start + i) % HISTORY];
+        }
+        true
+    }
+
     /// The level of the `n` input samples that end `end` samples in, dBFS RMS.
     pub fn level_ending(&self, end: u64, n: usize) -> Option<f32> {
         let start = self.start_of(end, n)?;
@@ -114,6 +124,7 @@ pub fn start(voices: piano::Voices) -> Shared {
         let signal = match kind.as_str() {
             "guitar" => Signal::Guitar,
             "quiet" => Signal::Quiet,
+            "warmup" => Signal::Warmup,
             _ => Signal::Voice,
         };
         thread::Builder::new()
@@ -244,6 +255,8 @@ fn synthesize(shared: Shared, signal: Signal, voices: piano::Voices) {
 pub enum Signal {
     Guitar,
     Voice,
+    /// A singer doing the five-note warm-up (see `warmup_sung`).
+    Warmup,
     /// Just the hiss: for trying the piano.
     Quiet,
 }
@@ -276,8 +289,8 @@ impl Synth {
         self.n += 1;
         let x = match self.signal {
             Signal::Guitar => pluck(t),
-            Signal::Voice => {
-                let (hz, amp) = sung(t);
+            Signal::Voice | Signal::Warmup => {
+                let (hz, amp) = if matches!(self.signal, Signal::Voice) { sung(t) } else { warmup_sung(t) };
                 self.phase = (self.phase + hz / Self::RATE as f64).fract();
                 amp * voice_wave(self.phase)
             }
@@ -295,6 +308,7 @@ impl Synth {
         match self.signal {
             Signal::Guitar => plucked(t).map_or((0.0, 0.0), |(hz, since)| (hz, (-since * 1.3).exp() as f32)),
             Signal::Voice => sung(t),
+            Signal::Warmup => warmup_sung(t),
             Signal::Quiet => (0.0, 0.0),
         }
     }
@@ -353,6 +367,33 @@ fn sung(t: f64) -> (f64, f32) {
     let vibrato = 0.3 * ((since - 0.15) / 0.2).clamp(0.0, 1.0) * (std::f64::consts::TAU * 5.5 * since).sin();
     // Each note swells in and fades a little.
     let env = (since / 0.03).min(1.0) * (1.0 - 0.3 * since / NOTE);
+    (freq(base + vibrato), env as f32)
+}
+
+/// The test singer's warm-up: the five-note scale once every `WARMUP_CYCLE` s, starting
+/// `WARMUP_AT` s into it (after the piano has played it, when the session started a second
+/// in), `WARMUP_NOTE` s a note, legato with a quick glide, a little vibrato, some notes off
+/// by `WARMUP_CENTS`. A semitone higher each time, C3 up to C4 and back, as the app goes.
+pub const WARMUP_CENTS: [f64; 9] = [0.0, 0.0, 15.0, 0.0, -18.0, 0.0, 0.0, 6.0, 0.0];
+const WARMUP_CYCLE: f64 = 13.0;
+const WARMUP_AT: f64 = 6.0;
+const WARMUP_NOTE: f64 = 0.7;
+
+fn warmup_sung(t: f64) -> (f64, f32) {
+    let rep = (t / WARMUP_CYCLE) as i32 % 24;
+    let root = 48.0 + rep.min(24 - rep) as f64;
+    let pos = t % WARMUP_CYCLE - WARMUP_AT;
+    let steps = crate::warmup::PATTERNS[0].steps;
+    if !(0.0..WARMUP_NOTE * steps.len() as f64).contains(&pos) {
+        return (freq(root), 0.0);
+    }
+    let i = (pos / WARMUP_NOTE) as usize;
+    let since = pos - i as f64 * WARMUP_NOTE;
+    let at = |i: usize| root + steps[i] as f64 + WARMUP_CENTS[i] / 100.0;
+    let from = at(i.saturating_sub(1));
+    let base = from + (at(i) - from) * (since / 0.06).min(1.0);
+    let vibrato = 0.12 * ((since - 0.15) / 0.2).clamp(0.0, 1.0) * (std::f64::consts::TAU * 5.5 * since).sin();
+    let env = (pos / 0.03).min(1.0) * (1.0 - 0.2 * since / WARMUP_NOTE);
     (freq(base + vibrato), env as f32)
 }
 

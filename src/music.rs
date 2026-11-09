@@ -1,6 +1,8 @@
 //! Notes, tunings and cents. Pitches are MIDI note numbers (A4 = 69), fractional where
 //! measured, relative to an adjustable A4 reference.
 
+use serde::{Deserialize, Serialize};
+
 const SHARPS: [&str; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
 const FLATS: [&str; 12] = ["C", "D♭", "D", "E♭", "E", "F", "G♭", "G", "A♭", "A", "B♭", "B"];
 
@@ -89,6 +91,15 @@ pub fn nearest_string(tuning: &Tuning, midi: f32) -> Option<usize> {
     })
 }
 
+/// Where `midi` is on a guitar with these open strings (lowest first), up to fret `frets`:
+/// (string, fret), lowest fret first, so the first is where it is in first position.
+pub fn fret_positions(midi: i32, strings: &[i32], frets: i32) -> Vec<(usize, i32)> {
+    let mut at: Vec<(usize, i32)> =
+        strings.iter().enumerate().map(|(s, &open)| (s, midi - open)).filter(|&(_, f)| (0..=frets).contains(&f)).collect();
+    at.sort_by_key(|&(_, f)| f);
+    at
+}
+
 /// Guitarists number strings from the thinnest: the lowest of six is the 6th.
 pub fn string_number(tuning: &Tuning, index: usize) -> usize {
     tuning.strings.len() - index
@@ -97,14 +108,43 @@ pub fn string_number(tuning: &Tuning, index: usize) -> usize {
 // Staff notation. Notes are spelled in a key (letter, alteration, octave) and placed in
 // steps, one per line or space: step = octave·7 + letter, C0 = 0. Everything here is in
 // sounding pitch; the treble-8 clef writes it an octave higher, so its lines (E4 G4 B4 D5 F5
-// written) sound E3 G3 B3 D4 F4.
+// written) sound E3 G3 B3 D4 F4. The treble and bass clefs write it as it sounds: E4 G4 B4
+// D5 F5, and G2 B2 D3 F3 A3.
 
 const LETTERS: [&str; 7] = ["C", "D", "E", "F", "G", "A", "B"];
 const NATURAL_PC: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
 const MAJOR: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
 
-/// The treble-8 staff's lines, bottom to top (E3 G3 B3 D4 F4).
-pub const STAFF_LINES: [i32; 5] = [23, 25, 27, 29, 31];
+/// The staff's clef: a tenor's treble-8, the treble clef (soprano and alto parts, piano), or
+/// the bass clef (baritone and bass parts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Clef {
+    #[default]
+    Treble8,
+    Treble,
+    Bass,
+}
+
+impl Clef {
+    /// The staff's lines, bottom to top: E3 G3 B3 D4 F4, E4 G4 B4 D5 F5, or G2 B2 D3 F3 A3.
+    pub fn lines(self) -> [i32; 5] {
+        match self {
+            Clef::Treble8 => [23, 25, 27, 29, 31],
+            Clef::Treble => [30, 32, 34, 36, 38],
+            Clef::Bass => [18, 20, 22, 24, 26],
+        }
+    }
+
+    /// The line the clef marks: G3 (or G4) for the G clef's curl, F3 between the F clef's dots.
+    pub fn line(self) -> i32 {
+        match self {
+            Clef::Treble8 => 25,
+            Clef::Treble => 32,
+            Clef::Bass => 24,
+        }
+    }
+}
 
 pub struct Key {
     pub name: &'static str,
@@ -130,6 +170,15 @@ pub const KEYS: &[Key] = &[
     Key { name: "F", tonic: 5, letter: 3, relative_minor: "D minor" },
 ];
 
+/// A pitch class's place on the circle of fifths, clockwise from C: a fifth (7 semitones)
+/// a step. `KEYS` is in this order.
+pub fn fifths_position(midi: i32) -> usize {
+    (midi.rem_euclid(12) * 7 % 12) as usize
+}
+
+/// The chords on a major scale's degrees, I to vii°: the quality to add to each note's name.
+pub const DEGREES: [(&str, &str); 7] = [("I", ""), ("ii", "m"), ("iii", "m"), ("IV", ""), ("V", ""), ("vi", "m"), ("vii°", "°")];
+
 pub fn key_index(name: &str) -> usize {
     KEYS.iter().position(|k| k.name == name).unwrap_or(0)
 }
@@ -153,19 +202,45 @@ impl Key {
         alt
     }
 
+    /// The scale from the tonic, spelled: G A B C D E F♯.
+    pub fn scale(&self) -> Vec<String> {
+        let alt = self.alterations();
+        (0..7)
+            .map(|d| {
+                let letter = (self.letter + d) % 7;
+                Spelled { letter, alter: alt[letter], octave: 4, shown: None }.name()
+            })
+            .collect()
+    }
+
+    /// The key signature's sharps or flats by name, in the order they're written: F♯ C♯ ….
+    pub fn accidentals(&self) -> Vec<String> {
+        let alt = self.alterations();
+        let sharps = [3, 0, 4, 1, 5, 2, 6].into_iter().filter(|&l| alt[l] == 1).map(|l| format!("{}♯", LETTERS[l]));
+        let flats = [6, 2, 5, 1, 4, 0, 3].into_iter().filter(|&l| alt[l] == -1).map(|l| format!("{}♭", LETTERS[l]));
+        sharps.chain(flats).collect()
+    }
+
     fn in_key(&self, midi: i32) -> bool {
         let alt = self.alterations();
         (0..7).any(|l| (NATURAL_PC[l] + alt[l]).rem_euclid(12) == midi.rem_euclid(12))
     }
 
-    /// The key signature as written on the treble-8 staff, left to right: (step, sign).
-    pub fn signature(&self) -> Vec<(i32, Accidental)> {
-        // Sharps go F C G D A E B, flats B E A D G C F, at their usual treble-clef places.
+    /// The key signature as written with `clef`, left to right: (step, sign).
+    pub fn signature(&self, clef: Clef) -> Vec<(i32, Accidental)> {
+        // Sharps go F C G D A E B, flats B E A D G C F, at their usual treble-clef places (an
+        // octave up for the plain treble clef); the bass clef puts them in the same places on
+        // its staff, an octave below treble-8.
         const SHARPS: [(usize, i32); 7] = [(3, 31), (0, 28), (4, 32), (1, 29), (5, 26), (2, 30), (6, 27)];
         const FLATS: [(usize, i32); 7] = [(6, 27), (2, 30), (5, 26), (1, 29), (4, 25), (0, 28), (3, 24)];
+        let down = match clef {
+            Clef::Treble8 => 0,
+            Clef::Treble => -7,
+            Clef::Bass => 7,
+        };
         let alt = self.alterations();
-        let sharps = SHARPS.iter().filter(|(l, _)| alt[*l] == 1).map(|&(_, s)| (s, Accidental::Sharp));
-        let flats = FLATS.iter().filter(|(l, _)| alt[*l] == -1).map(|&(_, s)| (s, Accidental::Flat));
+        let sharps = SHARPS.iter().filter(|(l, _)| alt[*l] == 1).map(|&(_, s)| (s - down, Accidental::Sharp));
+        let flats = FLATS.iter().filter(|(l, _)| alt[*l] == -1).map(|&(_, s)| (s - down, Accidental::Flat));
         sharps.chain(flats).collect()
     }
 }
@@ -236,9 +311,53 @@ pub fn staff_position(midi: f32, key: &Key) -> f32 {
     spell(lo, key).step() as f32 + (midi - lo as f32) / (hi - lo) as f32
 }
 
-/// The ledger lines a note at `step` needs, beyond the treble-8 staff.
-pub fn ledger_lines(step: i32) -> Vec<i32> {
-    let (bottom, top) = (STAFF_LINES[0], STAFF_LINES[4]);
+/// The note of `key` written at `step` (a line or space): what a note head there means, with
+/// the key signature applied.
+pub fn note_at_step(step: i32, key: &Key) -> i32 {
+    let letter = step.rem_euclid(7) as usize;
+    (step.div_euclid(7) + 1) * 12 + NATURAL_PC[letter] + key.alterations()[letter]
+}
+
+/// Chord shapes, as semitones above the root, and what's added to the root's name.
+const CHORDS: [(&[i32], &str); 11] = [
+    (&[0, 4, 7], ""),
+    (&[0, 3, 7], "m"),
+    (&[0, 3, 6], "°"),
+    (&[0, 4, 8], "+"),
+    (&[0, 2, 7], "sus2"),
+    (&[0, 5, 7], "sus4"),
+    (&[0, 4, 7, 10], "7"),
+    (&[0, 4, 7, 11], "maj7"),
+    (&[0, 3, 7, 10], "m7"),
+    (&[0, 3, 6, 10], "ø7"),
+    (&[0, 3, 6, 9], "°7"),
+];
+
+/// The name of the chord these notes make, spelled in `key`: "Am", "G7", or "C/E" when the
+/// lowest note isn't the root. Triads and seventh chords in any voicing; none for anything
+/// else (two notes, clusters). The lowest note is tried as the root first, so C D G is Csus2,
+/// not Gsus4.
+pub fn chord_name(notes: &[i32], key: &Key) -> Option<String> {
+    let bass = *notes.iter().min()?;
+    let mut pcs: Vec<i32> = notes.iter().map(|n| n.rem_euclid(12)).collect();
+    pcs.sort_unstable();
+    pcs.dedup();
+    let roots = std::iter::once(bass.rem_euclid(12)).chain(pcs.iter().copied().filter(|&p| p != bass.rem_euclid(12)));
+    let name = |pc: i32| spell(60 + pc, key).name();
+    for root in roots {
+        let mut shape: Vec<i32> = pcs.iter().map(|p| (p - root).rem_euclid(12)).collect();
+        shape.sort_unstable();
+        if let Some((_, quality)) = CHORDS.iter().find(|(s, _)| *s == shape.as_slice()) {
+            let over = if root == bass.rem_euclid(12) { String::new() } else { format!("/{}", name(bass)) };
+            return Some(format!("{}{quality}{over}", name(root)));
+        }
+    }
+    None
+}
+
+/// The ledger lines a note at `step` needs, beyond the staff of `clef`.
+pub fn ledger_lines(step: i32, clef: Clef) -> Vec<i32> {
+    let (bottom, top) = (clef.lines()[0], clef.lines()[4]);
     let odd = |s: &i32| s.rem_euclid(2) == bottom.rem_euclid(2);
     if step < bottom {
         (step..bottom).filter(odd).collect()
@@ -274,13 +393,32 @@ mod tests {
     }
 
     #[test]
+    fn scales_and_the_circle() {
+        assert_eq!(key("G").scale().join(" "), "G A B C D E F♯");
+        assert_eq!(key("F").scale().join(" "), "F G A B♭ C D E");
+        assert_eq!(key("F♯").scale().join(" "), "F♯ G♯ A♯ B C♯ D♯ E♯");
+        assert_eq!(key("A").accidentals(), ["F♯", "C♯", "G♯"]);
+        assert_eq!(key("E♭").accidentals(), ["B♭", "E♭", "A♭"]);
+        assert!(key("C").accidentals().is_empty());
+        for (i, k) in KEYS.iter().enumerate() {
+            assert_eq!(fifths_position(k.tonic), i, "{}", k.name);
+        }
+    }
+
+    #[test]
     fn key_signatures_in_writing_order() {
-        let steps = |k: &str| key(k).signature();
+        let steps = |k: &str| key(k).signature(Clef::Treble8);
         assert!(steps("C").is_empty());
         assert_eq!(steps("D"), [(31, Accidental::Sharp), (28, Accidental::Sharp)]);
         assert_eq!(steps("E♭").iter().map(|s| s.0).collect::<Vec<_>>(), [27, 30, 26]);
         assert_eq!(steps("F♯").len(), 6);
         assert_eq!(steps("D♭").len(), 5);
+        // Bass clef: F♯ on the F line, C♯ in the second space; B♭ on the second line.
+        assert_eq!(key("D").signature(Clef::Bass), [(24, Accidental::Sharp), (21, Accidental::Sharp)]);
+        assert_eq!(key("F").signature(Clef::Bass), [(20, Accidental::Flat)]);
+        // Treble: F♯5 on the top line, B♭4 on the middle one.
+        assert_eq!(key("G").signature(Clef::Treble), [(38, Accidental::Sharp)]);
+        assert_eq!(key("F").signature(Clef::Treble), [(34, Accidental::Flat)]);
     }
 
     #[test]
@@ -288,23 +426,76 @@ mod tests {
         let c = key("C");
         // The lines sound E3 G3 B3 D4 F4.
         let lines: Vec<i32> = [52, 55, 59, 62, 65].iter().map(|&m| spell(m, c).step()).collect();
-        assert_eq!(lines, STAFF_LINES);
+        assert_eq!(lines, Clef::Treble8.lines());
+        let bass: Vec<i32> = [43, 47, 50, 53, 57].iter().map(|&m| spell(m, c).step()).collect();
+        assert_eq!(bass, Clef::Bass.lines(), "G2 B2 D3 F3 A3");
+        assert_eq!(spell(53, c).step(), Clef::Bass.line(), "the F clef marks F3");
+        assert_eq!(spell(55, c).step(), Clef::Treble8.line(), "the G clef marks G3");
+        let treble: Vec<i32> = [64, 67, 71, 74, 77].iter().map(|&m| spell(m, c).step()).collect();
+        assert_eq!(treble, Clef::Treble.lines(), "E4 G4 B4 D5 F5");
+        assert_eq!(spell(67, c).step(), Clef::Treble.line(), "the plain G clef marks G4");
         // C♯ sits halfway between C and D; in-key notes exactly on their step.
         assert_eq!(staff_position(61.0, c), spell(60, c).step() as f32 + 0.5);
         assert_eq!(staff_position(64.0, c), spell(64, c).step() as f32);
         assert_eq!(staff_position(64.5, c), spell(64, c).step() as f32 + 0.5, "E to F is one semitone, one step");
         // In G, F♯ is on the F line.
-        assert_eq!(staff_position(66.0, key("G")), STAFF_LINES[4] as f32);
+        assert_eq!(staff_position(66.0, key("G")), Clef::Treble8.lines()[4] as f32);
+    }
+
+    #[test]
+    fn a_step_reads_as_the_keys_note() {
+        // The treble-8 lines: E3 G3 B3 D4 F4; in G the top line is F♯4, in F the middle B♭3.
+        assert_eq!(Clef::Treble8.lines().map(|s| note_at_step(s, key("C"))), [52, 55, 59, 62, 65]);
+        assert_eq!(note_at_step(31, key("G")), 66);
+        assert_eq!(note_at_step(27, key("F")), 58);
+        assert_eq!(note_at_step(30, key("F♯")), 65, "E♯4");
+        for k in KEYS {
+            for m in (36..84).filter(|&m| k.in_key(m)) {
+                assert_eq!(note_at_step(spell(m, k).step(), k), m, "{} in {}", m, k.name);
+            }
+        }
+    }
+
+    #[test]
+    fn chords_are_named_from_their_notes() {
+        let c = key("C");
+        let name = |notes: &[i32], k: &str| chord_name(notes, key(k));
+        assert_eq!(name(&[48, 52, 55], "C").as_deref(), Some("C"));
+        assert_eq!(name(&[57, 60, 64], "C").as_deref(), Some("Am"));
+        assert_eq!(name(&[52, 55, 60], "C").as_deref(), Some("C/E"), "first inversion");
+        assert_eq!(name(&[43, 47, 50, 53], "C").as_deref(), Some("G7"));
+        assert_eq!(name(&[48, 50, 55], "C").as_deref(), Some("Csus2"), "the bass is the root");
+        assert_eq!(name(&[59, 62, 65], "C").as_deref(), Some("B°"));
+        assert_eq!(name(&[51, 55, 58], "E♭").as_deref(), Some("E♭"), "spelled in the key");
+        assert_eq!(name(&[48, 60, 64, 67], "C").as_deref(), Some("C"), "doubled notes");
+        assert_eq!(chord_name(&[48, 52], c), None, "two notes");
+        assert_eq!(chord_name(&[48, 49, 50], c), None);
+        assert_eq!(chord_name(&[], c), None);
+    }
+
+    #[test]
+    fn notes_on_the_fretboard_lowest_fret_first() {
+        let standard = TUNINGS[tuning_index("Standard")].strings;
+        assert_eq!(fret_positions(60, standard, 12), [(4, 1), (3, 5), (2, 10)], "C4: B string 1st fret");
+        assert_eq!(fret_positions(64, standard, 12), [(5, 0), (4, 5), (3, 9)], "E4: the open high E");
+        assert_eq!(fret_positions(43, standard, 12), [(0, 3)], "G2");
+        assert!(fret_positions(39, standard, 12).is_empty(), "below the low E");
     }
 
     #[test]
     fn ledger_lines_below_and_above() {
-        assert!(ledger_lines(27).is_empty());
-        assert!(ledger_lines(22).is_empty(), "D3 hangs below the staff");
-        assert_eq!(ledger_lines(21), [21], "C3");
-        assert_eq!(ledger_lines(18), [19, 21], "G2");
-        assert_eq!(ledger_lines(33), [33], "A4");
-        assert_eq!(ledger_lines(36), [33, 35], "D5");
+        let t = Clef::Treble8;
+        assert!(ledger_lines(27, t).is_empty());
+        assert!(ledger_lines(22, t).is_empty(), "D3 hangs below the staff");
+        assert_eq!(ledger_lines(21, t), [21], "C3");
+        assert_eq!(ledger_lines(18, t), [19, 21], "G2");
+        assert_eq!(ledger_lines(33, t), [33], "A4");
+        assert_eq!(ledger_lines(36, t), [33, 35], "D5");
+        // Bass: middle C has one above, E2 one below.
+        assert_eq!(ledger_lines(28, Clef::Bass), [28], "C4");
+        assert_eq!(ledger_lines(16, Clef::Bass), [16], "E2");
+        assert!(ledger_lines(17, Clef::Bass).is_empty(), "F2 hangs below");
+        assert_eq!(ledger_lines(28, Clef::Treble), [28], "middle C below the treble staff");
     }
 
     #[test]
